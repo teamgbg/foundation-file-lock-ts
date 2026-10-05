@@ -1,37 +1,14 @@
 /**
  * @system file-lock
  * @status handwritten
- * @edit edit directly
+ * @edit a host-wide bounded-concurrency gate (a counting semaphore over K lockfile "slots") for frequent-but-heavy work where K=1 over-serialises (violating iteration-speed-budget) yet N concurrent lane pushes saturate the host (the 2026-07-18 load-42 publish-build storm); the K=1 case is exactly withFileLock, and this is the bounded-K generalisation for the build-storm arm of no-uncontrolled-repetition-or-cascade
  *
- * Host-wide bounded-concurrency gate (a counting semaphore over K lockfile
- * "slots"), built on withFileLock. At most `concurrency` holders run the
- * critical section concurrently ACROSS THE WHOLE HOST — the thundering-herd
- * gate for frequent-but-heavy work (e.g. publish-time tsgo/smoke builds) where
- * a full mutex (K=1) would over-serialise and violate iteration-speed-budget,
- * yet N concurrent lane pushes stacking the heavy step saturates the host
- * (the 2026-07-18 load-42 publish-build storm).
- *
- * Mechanism: K slot lockfiles (`<basePath>.0.lock` ... `<basePath>.K-1.lock`),
- * each a standard PID-lockfile (stale-PID reclaim built into withFileLock, so a
- * crashed holder's slot is reclaimed by the next sweeper — no permanent slot
- * leak). Acquire sweeps the slots with non-blocking tries (withFileLock
- * `timeoutMs:0` = one try, throws immediately if held); the first free slot
- * runs `fn` and releases in finally. If every slot is busy, the sweeper sleeps
- * `pollIntervalMs` and retries until `timeoutMs`, then FAIL-OPENs (runs `fn`
- * without a slot, logging) — this is a thundering-herd OPTIMISATION, never a
- * correctness gate: a waiter is delayed, never blocked/503'd. Fail-open is the
- * load-shedding escape so a stuck/dead slot can never permanently stall a publish.
- *
- * Why slots not a counter file: each slot is a PID-lockfile, so withFileLock's
- * dead-PID + PID-less stale reclaim handles holder crashes for FREE — a counter
- * file would need its own crash-consistent decrement/reclaim logic (the
- * "incremented then crashed → count permanently inflated → semaphore drained"
- * class). Slots trade K lockfiles for crash-safety-by-reuse-of-withFileLock.
- *
- * Sibling of withFileLock (the K=1 case is exactly withFileLock); pairs with
- * restart-drivers-serialize-via-lock + client-asset-builds-serialize-via-lock
- * (both K=1 mutexes) as the bounded-K generalisation for the build-storm arm of
- * no-uncontrolled-repetition-or-cascade.
+ * Mechanism: K slot lockfiles (`<basePath>.0.lock` … `<basePath>.K-1.lock`), each a standard PID-lockfile,
+ * so withFileLock's stale-PID reclaim returns a crashed holder's slot for free. Slots rather than a counter
+ * file because a counter would need its own crash-consistent decrement — the "incremented then crashed →
+ * count permanently inflated → semaphore drained" class. A sweeper polls the slots with non-blocking tries
+ * and, if all are busy past `timeoutMs`, FAIL-OPENS: this is a thundering-herd OPTIMISATION, never a
+ * correctness gate, so a stuck slot can never permanently stall a publish.
  */
 import { getAppLogger } from "@teamscala/logger/app-loggers";
 import { withFileLock } from "./with-lock.ts";
@@ -51,11 +28,7 @@ export interface BoundedSemaphoreOptions {
 	stalePidCheck?: boolean;
 }
 
-/**
- * Run `fn` under a host-wide bounded-concurrency gate. At most `concurrency`
- * callers run fn concurrently across the whole host; the rest wait (polled) up
- * to `timeoutMs`, then fail-open (or throw if `failOpen:false`).
- */
+/** Run `fn` under a host-wide bounded-concurrency gate. At most `concurrency` callers run fn concurrently across the whole host; the rest wait (polled) up to `timeoutMs`, then fail-open (or throw if `failOpen:false`). */
 export async function withBoundedSemaphore<T>(
 	basePath: string,
 	opts: BoundedSemaphoreOptions,
@@ -75,9 +48,7 @@ export async function withBoundedSemaphore<T>(
 		for (let slot = 0; slot < concurrency; slot++) {
 			const slotPath = `${basePath}.${slot}.lock`;
 			try {
-				// timeoutMs:0 = one non-blocking try. If the slot is FREE,
-				// withFileLock acquires it, runs fn, releases in finally, returns.
-				// If BUSY, withFileLock throws "timed out acquiring" immediately.
+				// timeoutMs:0 = one non-blocking try: withFileLock acquires a FREE slot, runs fn and releases in finally, or throws "timed out acquiring" immediately when BUSY.
 				return await withFileLock(slotPath, slotOpts, fn);
 			} catch (err) {
 				const msg = err instanceof Error ? err.message : String(err);

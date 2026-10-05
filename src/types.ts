@@ -1,7 +1,6 @@
 /**
  * @system file-lock
  * @status handwritten
- * @edit edit directly
  */
 
 export interface LockOptions {

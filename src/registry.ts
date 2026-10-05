@@ -1,7 +1,6 @@
 /**
  * @system file-lock
  * @status handwritten
- * @edit edit directly
  */
 
 import type { ActiveLockInfo } from "./types.ts";

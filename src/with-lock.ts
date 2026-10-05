@@ -1,29 +1,10 @@
 /**
  * @system file-lock
  * @status handwritten
- * @edit edit directly
+ * @edit the single sanctioned file-locking surface (constitution `file-lock-is-the-only-file-lock`) — a lock is an atomic lockfile holding the holder PID (not flock(2), see doctrine), written to a process-unique temp file and `link()`ed into place, so the lockfile NEVER exists in a PID-less state
  *
- * The single sanctioned file-locking surface (constitution
- * `file-lock-is-the-only-file-lock`). A lock is an atomic lockfile holding the
- * holder PID (not flock(2) — see doctrine). Acquire writes the PID to a
- * process-unique temp file, then atomically `link()`s it into place — so the
- * lockfile NEVER exists in a PID-less state. Stale-reclaim breaks both a
- * dead-PID lockfile and a PID-less/empty one.
- *
- * Why link-from-temp (incident 2026-07-02): the prior acquire was
- * `open(path, "wx")` [creates an EMPTY file] then `writeFile(pid)` in a second
- * step. A holder killed in the window between those syscalls orphaned an EMPTY
- * lockfile, and stale-reclaim was dead-PID-only (gated on `holder !== null`) —
- * `readHolderPid` parses the empty contents as NaN → returns null → reclaim
- * never fires → every subsequent caller polled 180s then timed out. One such
- * orphan starved the whole fleet's restart lock for ~50min. link-from-temp
- * makes the lockfile appear atomically WITH the PID already inside (link is the
- * atomic test-and-create-with-content), so a PID-less lockfile is now
- * structurally impossible; the broadened reclaim also clears any pre-existing
- * PID-less orphan left by an old-version holder during rollout.
- *
- * Released in a finally and on graceful process exit; unexpected deaths are
- * reclaimed by the next caller's stale check.
+ * Released in a finally and on graceful process exit; unexpected deaths are reclaimed by the next
+ * caller's stale check.
  */
 
 import { linkSync } from "node:fs";
@@ -59,13 +40,10 @@ export async function withFileLock<T>(
 ): Promise<T> {
 	const { timeoutMs, pollIntervalMs = 50, stalePidCheck = true } = opts;
 
-	// Disabled locks (registry/config override) run the critical section without
-	// serialising — transparent fall-through, mirroring cache/spawn disable.
+	// Disabled locks (registry/config override) run the critical section without serialising — transparent fall-through, mirroring cache/spawn disable.
 	if (fileLockRegistry.isDisabled(path)) return fn();
 
-	// Temp lives in the lock's own dir so link()'s source and target share one
-	// filesystem (hardlinks cannot cross mount boundaries). Name is unique per
-	// invocation (pid + nanos + random), so concurrent acquirers never collide.
+	// Temp lives in the lock's own dir so link()'s source and target share one filesystem (hardlinks cannot cross mount boundaries); the name is unique per invocation (pid + nanos + random), so concurrent acquirers never collide.
 	const temp = join(
 		dirname(path),
 		`.scala-lock-tmp.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}`,
@@ -74,10 +52,7 @@ export async function withFileLock<T>(
 	const deadline = Date.now() + timeoutMs;
 	try {
 		for (;;) {
-			// Write the PID to the temp file FIRST (exclusively), then atomically
-			// link it into place. On success the lockfile appears with the PID
-			// already inside; on EEXIST it is held and we fall through to the
-			// stale check.
+			// Write the PID to the temp file FIRST (exclusively), then atomically link it into place: on success the lockfile appears with the PID already inside; on EEXIST it is held and we fall through to the stale check.
 			await writeFile(temp, String(process.pid), { flag: "wx" });
 			let acquired = false;
 			try {
@@ -86,17 +61,12 @@ export async function withFileLock<T>(
 			} catch (err) {
 				if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
 			} finally {
-				// path (if linked) is an independent hardlink now; removing temp
-				// never disturbs a linked lockfile's contents.
+				// path (if linked) is an independent hardlink now; removing temp never disturbs a linked lockfile's contents.
 				await unlink(temp).catch(() => {});
 			}
 			if (acquired) break;
 
-			// Lock is held. Break it if the holder is dead OR PID-less. Under
-			// link-from-temp a live holder ALWAYS links a PID in, so a PID-less
-			// (empty/unreadable) lockfile is definitively a stale orphan — the
-			// prior bug class that starved the fleet when a holder died
-			// mid-acquire and left an empty file the dead-PID check couldn't break.
+			// Lock is held. Break it if the holder is dead OR PID-less: under link-from-temp a live holder ALWAYS links a PID in, so a PID-less lockfile is definitively a stale orphan.
 			if (stalePidCheck) {
 				const holder = await readHolderPid(path);
 				if (holder === null || !isAlive(holder)) {
@@ -118,9 +88,7 @@ export async function withFileLock<T>(
 	}
 
 	fileLockRegistry.register(path, process.pid);
-	// Release on graceful exit. SIGKILL/crash leaves the file → reclaimed by the
-	// next caller's stale check. (No signal-shutdown phase: sibling-primitive
-	// horizontal dep is forbidden.)
+	// Release on graceful exit. SIGKILL/crash leaves the file → reclaimed by the next caller's stale check. (No signal-shutdown phase: sibling-primitive horizontal dep is forbidden.)
 	const onExit = async (): Promise<void> => {
 		try {
 			await rm(path);
